@@ -226,13 +226,32 @@ def generic_preprocess(df_in, null_thresh, fill_num, fill_cat, remove_dupes):
                  "dropped_cols": drop_cols, "rows_dropped": rows_before - len(df2)}
 
 
+def coerce_numerics(df):
+    """Try converting object columns to numeric; keep conversion only when
+    ≥80 % of non-null values parse successfully (avoids destroying text cols)."""
+    for col in df.select_dtypes(include="object").columns:
+        converted = pd.to_numeric(df[col], errors="coerce")
+        non_null  = df[col].notna().sum()
+        if non_null == 0 or converted.notna().sum() / non_null >= 0.8:
+            df[col] = converted
+    return df
+
+
 def train_models(df_in, target, model_names, test_size_pct):
     from sklearn.model_selection import train_test_split
     from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-    from sklearn.metrics import mean_absolute_error, r2_score
+    from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
     from xgboost import XGBRegressor
-    ncols = df_in.select_dtypes(include=np.number).columns.tolist()
-    feats = [c for c in ncols if c != target and df_in[c].std() > 0]
+    # encode any remaining text columns so models always have features
+    for _col in list(df_in.columns):
+        if _col != target and not pd.api.types.is_numeric_dtype(df_in[_col]):
+            df_in[_col] = pd.Series(
+                pd.factorize(df_in[_col])[0], index=df_in.index, dtype="int64"
+            )
+    feats = [c for c in df_in.columns
+             if c != target and pd.api.types.is_numeric_dtype(df_in[c])]
+    if not feats:
+        raise ValueError(f"No usable feature columns found — target='{target}'.")
     X = df_in[feats].fillna(0)
     y = df_in[target]
     X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=test_size_pct/100, random_state=42)
@@ -249,8 +268,10 @@ def train_models(df_in, target, model_names, test_size_pct):
     for name in model_names:
         if name not in catalogue: continue
         m = catalogue[name]; m.fit(X_tr, y_tr); p = m.predict(X_te)
-        mae = mean_absolute_error(y_te, p); r2 = r2_score(y_te, p)
-        results[name] = {"MAE": round(mae,4), "R²": round(r2,4)}
+        mae  = mean_absolute_error(y_te, p)
+        rmse = float(mean_squared_error(y_te, p) ** 0.5)
+        r2   = r2_score(y_te, p)
+        results[name] = {"MAE": round(mae,4), "RMSE": round(rmse,4), "R²": round(r2,4)}
         if r2 > best_r2:
             best_r2, best_name, best_preds, best_obj = r2, name, p.tolist(), m
             if hasattr(m,"feature_importances_"):
@@ -520,10 +541,11 @@ tab2_content = dbc.Container(fluid=True, style={"background":LIGHT_BG,"padding":
         ], style=CARD),
     ]),
 
-    # ── Step 4: Train / Predict ─────────────────────────────
+    # ── Step 4: Train / Predict / Cluster ──────────────────
     _panel("panel-4", [
         html.Div([
-            html.H6("Step 4 · Train or Predict", style={"fontWeight":"700","marginBottom":"16px"}),
+            html.H6("Step 4 · Train, Predict or Cluster",
+                    style={"fontWeight":"700","marginBottom":"16px"}),
 
             # mode toggle
             dbc.Row([
@@ -533,6 +555,7 @@ tab2_content = dbc.Container(fluid=True, style={"background":LIGHT_BG,"padding":
                         options=[
                             {"label": "  🚀  Train a new model",        "value": "train"},
                             {"label": "  🔮  Predict on this dataset",   "value": "predict"},
+                            {"label": "  🔵  K-Means Clustering",        "value": "cluster"},
                         ],
                         value="train", inline=True,
                         inputStyle={"marginRight":"6px"},
@@ -565,6 +588,17 @@ tab2_content = dbc.Container(fluid=True, style={"background":LIGHT_BG,"padding":
                     ], md=4, className="mb-3"),
                 ]),
                 dbc.Button("🚀  Run Training", id="btn-run-train", color="success", style=BTN),
+                html.Div([
+                    html.Label("Binary classification threshold",
+                               style={"fontSize":"13px","fontWeight":"600","marginBottom":"4px",
+                                      "display":"block"}),
+                    html.P("Scores ≥ threshold = positive match. Used for Accuracy / F1 / AUC-ROC.",
+                           style={"fontSize":"12px","color":SECONDARY,"marginBottom":"6px"}),
+                    dcc.Slider(id="thresh-slider", min=0.1, max=0.9, step=0.05, value=0.5,
+                               marks={v/10: f"{v/10:.1f}" for v in range(1, 10)},
+                               tooltip={"placement":"bottom"}),
+                ], style={"marginTop":"20px","padding":"12px","background":"#f8f9fa",
+                          "borderRadius":"8px","border":"1px solid #dee2e6"}),
                 dcc.Loading(html.Div(id="train-results", style={"marginTop":"20px"}),
                             type="circle", color=SUCCESS),
             ]),
@@ -587,6 +621,26 @@ tab2_content = dbc.Container(fluid=True, style={"background":LIGHT_BG,"padding":
                            disabled=True),
                 dcc.Loading(html.Div(id="predict-results", style={"marginTop":"20px"}),
                             type="circle", color=PRIMARY),
+            ]),
+
+            # ── CLUSTER SECTION ────────────────────────────────
+            html.Div(id="section-cluster", style={"display":"none"}, children=[
+                dbc.Row([
+                    dbc.Col([
+                        html.Label("Number of clusters (K)",
+                                   style={"fontSize":"13px","fontWeight":"600"}),
+                        dcc.Slider(id="kmeans-k", min=2, max=10, step=1, value=4,
+                                   marks={k: str(k) for k in range(2, 11)},
+                                   tooltip={"placement":"bottom"}),
+                    ], md=6, className="mb-3"),
+                    dbc.Col([
+                        html.P("Uses all numeric columns from the preprocessed dataset.",
+                               style={"fontSize":"12px","color":SECONDARY,"paddingTop":"28px"}),
+                    ], md=6),
+                ]),
+                dbc.Button("🔵  Run Clustering", id="btn-run-kmeans", color="info", style=BTN),
+                dcc.Loading(html.Div(id="kmeans-results", style={"marginTop":"20px"}),
+                            type="circle", color="#0dcaf0"),
             ]),
 
             dbc.Row([
@@ -1004,9 +1058,10 @@ def populate_target(cleaned):
     State("train-target","value"),
     State("train-models","value"),
     State("train-test-size","value"),
+    State("thresh-slider","value"),
     prevent_initial_call=True,
 )
-def run_training_cb(n, cleaned, target, models_sel, test_size):
+def run_training_cb(n, cleaned, target, models_sel, test_size, thresh):
     if not cleaned:
         return dbc.Alert("Run Preprocessing first.", color="warning"), no_update
     if not target:
@@ -1015,13 +1070,70 @@ def run_training_cb(n, cleaned, target, models_sel, test_size):
         return dbc.Alert("Select at least one model.", color="warning"), no_update
 
     df_c = store_to_df(cleaned)
+    coerce_numerics(df_c)
     if target not in df_c.columns:
         return dbc.Alert(f"Column '{target}' not found in cleaned data.", color="danger"), no_update
+
+    # Auto-encode text columns when there are no numeric features besides the target
+    num_feats_available = [c for c in df_c.columns
+                           if c != target and pd.api.types.is_numeric_dtype(df_c[c])]
+    encoded_cols = []
+    if not num_feats_available:
+        for col in list(df_c.columns):
+            if col == target or pd.api.types.is_numeric_dtype(df_c[col]):
+                continue
+            df_c[col] = pd.Series(
+                pd.factorize(df_c[col])[0], index=df_c.index, dtype="int64"
+            )
+            encoded_cols.append(col)
+
+    encode_banner = html.Div([
+        html.Span("ℹ️", style={"fontSize":"18px","marginRight":"10px"}),
+        html.Div([
+            html.Strong("Text columns were automatically encoded as numbers",
+                        style={"fontSize":"13px"}),
+            html.P(f"Encoded {len(encoded_cols)} column(s) using label encoding so they could be used as features: "
+                   + ", ".join(f"'{c}'" for c in encoded_cols[:10])
+                   + (" …" if len(encoded_cols) > 10 else "") + ".",
+                   style={"fontSize":"12px","margin":"4px 0 0 0","color":"#0c5460"}),
+        ]),
+    ], style={"display":"flex","alignItems":"flex-start","background":"#d1ecf1",
+              "border":"1px solid #bee5eb","borderRadius":"8px","padding":"12px 16px",
+              "marginBottom":"16px"}) if encoded_cols else None
 
     try:
         res = train_models(df_c, target, models_sel, test_size)
     except Exception as e:
-        return dbc.Alert(f"Training error: {e}", color="danger"), no_update
+        err_str = str(e)
+        if "No numeric feature columns" in err_str:
+            suggestion = [
+                html.Li("Your dataset has no usable columns after selecting the target."),
+                html.Li("Try switching to  🔵 K-Means Clustering  to find natural groups instead."),
+                html.Li("Or upload a dataset that has more numeric or low-cardinality text columns."),
+            ]
+        elif "Only one numeric column" in err_str:
+            suggestion = [html.Li("Add more numeric columns to your file, or switch to Clustering mode.")]
+        else:
+            suggestion = [html.Li("Check that your data has been preprocessed and the target column contains numbers.")]
+        error_card = html.Div([
+            html.Div([
+                html.Span("⚠️", style={"fontSize":"26px","lineHeight":"1","marginRight":"14px"}),
+                html.Div([
+                    html.H6("Training could not start", style={"fontWeight":"700","marginBottom":"6px","color":"#842029"}),
+                    html.Ul(suggestion, style={"fontSize":"13px","color":"#842029","paddingLeft":"18px","marginBottom":"8px"}),
+                    html.Details([
+                        html.Summary("Show technical details",
+                                     style={"fontSize":"12px","cursor":"pointer","color":SECONDARY}),
+                        html.Code(err_str,
+                                  style={"fontSize":"11px","display":"block","marginTop":"6px",
+                                         "padding":"8px","background":"#f8f9fa","borderRadius":"4px",
+                                         "wordBreak":"break-all","whiteSpace":"pre-wrap"}),
+                    ]),
+                ]),
+            ], style={"display":"flex","alignItems":"flex-start"}),
+        ], style={"background":"#fff5f5","border":"1px solid #f5c2c7","borderRadius":"10px",
+                  "padding":"16px 20px","marginTop":"8px"})
+        return html.Div([encode_banner, error_card] if encode_banner else error_card), no_update
 
     # save model server-side for Predict mode
     _model_store["model"]    = res["model_obj"]
@@ -1060,10 +1172,78 @@ def run_training_cb(n, cleaned, target, models_sel, test_size):
                                margin=dict(l=20,r=20,t=10,b=20), height=300,
                                xaxis_title="Importance")
 
-    return html.Div([
+    # ── binary classification card ────────────────────────────
+    from sklearn.metrics import (accuracy_score, f1_score,
+                                 roc_auc_score, confusion_matrix)
+    thresh  = thresh or 0.5
+    clf_card = html.Div()          # fallback: empty if predictions unavailable
+    if res["preds"] and res["y_test"]:
+        y_arr   = np.array(res["y_test"])
+        p_arr   = np.array(res["preds"])
+        y_bin   = (y_arr >= thresh).astype(int)
+        p_bin   = (p_arr >= thresh).astype(int)
+        acc     = accuracy_score(y_bin, p_bin)
+        f1      = f1_score(y_bin, p_bin, zero_division=0)
+        auc     = roc_auc_score(y_bin, p_arr) if len(set(y_bin)) > 1 else float("nan")
+        cm      = confusion_matrix(y_bin, p_bin)
+
+        # confusion matrix heatmap
+        cm_labels = ["Negative", "Positive"]
+        fig_cm = go.Figure(go.Heatmap(
+            z=cm, x=cm_labels, y=cm_labels,
+            text=cm, texttemplate="%{text}",
+            colorscale=[[0,"#f0f7ff"],[1,PRIMARY]],
+            showscale=False,
+        ))
+        fig_cm.update_layout(
+            xaxis_title="Predicted", yaxis_title="Actual",
+            plot_bgcolor="white", paper_bgcolor="white",
+            margin=dict(l=20,r=20,t=10,b=20), height=220,
+        )
+
+        def metric_chip(label, value, color):
+            return html.Div([
+                html.P(label, style={"fontSize":"11px","fontWeight":"700","color":SECONDARY,
+                                      "textTransform":"uppercase","marginBottom":"2px"}),
+                html.H4(f"{value:.3f}" if not np.isnan(value) else "N/A",
+                        style={"color":color,"fontWeight":"800","margin":0}),
+            ], style={"textAlign":"center","padding":"14px 20px","background":"white",
+                      "borderRadius":"10px","boxShadow":"0 1px 4px rgba(0,0,0,0.08)",
+                      "flex":"1","margin":"0 6px"})
+
+        clf_card = html.Div([
+            html.H6(f"Binary Classification View  (threshold = {thresh:.2f})",
+                    style={"fontWeight":"700","marginBottom":"12px"}),
+            html.Div([
+                metric_chip("Accuracy", acc,  SUCCESS),
+                metric_chip("F1 Score", f1,   WARNING),
+                metric_chip("AUC-ROC",  auc,  PRIMARY),
+            ], style={"display":"flex","marginBottom":"16px"}),
+            dbc.Row([
+                dbc.Col([
+                    html.P("Confusion Matrix", style={"fontWeight":"600","fontSize":"13px",
+                                                       "marginBottom":"4px"}),
+                    dcc.Graph(figure=fig_cm, style={"height":"220px"}),
+                ], md=5),
+                dbc.Col([
+                    html.P("How to read these metrics:", style={"fontWeight":"600",
+                                                                 "fontSize":"13px"}),
+                    html.Ul([
+                        html.Li("Accuracy — % of all predictions that were correct"),
+                        html.Li("F1 — harmonic mean of precision & recall; better for imbalanced data"),
+                        html.Li("AUC-ROC — probability that the model ranks a positive higher than a negative; 0.5 = random, 1.0 = perfect"),
+                    ], style={"fontSize":"12px","color":SECONDARY,"paddingLeft":"16px"}),
+                ], md=7),
+            ]),
+        ], style=CARD)
+
+    success_children = [encode_banner] if encode_banner else []
+    success_children += [
         dbc.Alert(f"✅  Training complete!  Best model: {best}", color="success",
                   style={"padding":"10px 16px","marginBottom":"12px"}),
-        # model comparison
+    ]
+    return html.Div(success_children + [
+        # model comparison (MAE · RMSE · R² auto-populated from dict keys)
         html.Div([
             html.H6("Model Performance", style={"fontWeight":"700"}),
             dash_table.DataTable(
@@ -1078,7 +1258,7 @@ def run_training_cb(n, cleaned, target, models_sel, test_size):
                 ],
             ),
         ], style=CARD),
-        # charts
+        # scatter + importance
         dbc.Row([
             dbc.Col(html.Div([
                 html.H6(f"Actual vs Predicted  ({best})", style={"fontWeight":"700"}),
@@ -1089,6 +1269,8 @@ def run_training_cb(n, cleaned, target, models_sel, test_size):
                 dcc.Graph(figure=imp_fig, style={"height":"300px"}),
             ], style=CARD) if res["importances"] else html.Div(), md=6),
         ]),
+        # binary classification card
+        clf_card,
         # feature list
         html.Div([
             html.P(f"Features used ({len(res['feats'])}):  " +
@@ -1102,12 +1284,16 @@ def run_training_cb(n, cleaned, target, models_sel, test_size):
 @app.callback(
     Output("section-train",   "style"),
     Output("section-predict", "style"),
+    Output("section-cluster", "style"),
     Input("step4-mode", "value"),
 )
 def toggle_step4_mode(mode):
-    show = {"display": "block"}
-    hide = {"display": "none"}
-    return (show, hide) if mode == "train" else (hide, show)
+    show, hide = {"display": "block"}, {"display": "none"}
+    return (
+        (show, hide, hide) if mode == "train"   else
+        (hide, show, hide) if mode == "predict" else
+        (hide, hide, show)
+    )
 
 
 # ── Populate predict "compare against" dropdown ──────────────
@@ -1126,10 +1312,11 @@ def update_predict_panel(step, cleaned, meta):
     num_opts = [{"label": c, "value": c}
                 for c in df_c.select_dtypes(include=np.number).columns]
 
-    if _model_store["model"] is not None:
+    if _model_store["model"] is not None and meta:
         status = dbc.Alert(
-            [html.Strong(f"✅  Model ready: "), f"{meta['best']}  ·  "
-             f"{len(meta['feats'])} features  ·  target: {meta['target']}"],
+            [html.Strong("✅  Model ready: "),
+             f"{meta.get('best','?')}  ·  "
+             f"{len(meta.get('feats',[]))} features  ·  target: {meta.get('target','?')}"],
             color="success", style={"padding": "10px 16px"},
         )
     else:
@@ -1150,102 +1337,132 @@ def update_predict_panel(step, cleaned, meta):
     prevent_initial_call=True,
 )
 def run_predict_cb(n, cleaned, actual_col):
-    if not cleaned:
-        return dbc.Alert("Run Preprocessing first.", color="warning"), True
+    try:
+        if not cleaned:
+            return dbc.Alert("Run Preprocessing first.", color="warning"), True
 
-    df_c = store_to_df(cleaned)
+        df_c = store_to_df(cleaned)
+        coerce_numerics(df_c)
 
-    # use existing model or auto-train XGBoost
-    if _model_store["model"] is not None:
-        model   = _model_store["model"]
-        feats   = _model_store["features"]
-        model_label = f"{_model_store['target']} model (already trained)"
-    else:
-        from xgboost import XGBRegressor
-        num_cols_c = df_c.select_dtypes(include=np.number).columns.tolist()
-        if not num_cols_c:
-            return dbc.Alert("No numeric columns found to predict on.", color="danger"), True
-        # pick last numeric column as target if no training done
-        target_auto = num_cols_c[-1]
-        feats = [c for c in num_cols_c if c != target_auto and df_c[c].std() > 0]
-        if not feats:
-            return dbc.Alert("Not enough numeric features to predict.", color="danger"), True
-        model = XGBRegressor(n_estimators=100, max_depth=4, learning_rate=0.05,
-                             random_state=42, n_jobs=-1, verbosity=0)
-        model.fit(df_c[feats].fillna(0), df_c[target_auto])
-        model_label = f"auto-trained XGBoost on '{target_auto}'"
-        _model_store["model"]    = model
-        _model_store["features"] = feats
-        _model_store["target"]   = target_auto
+        # use existing model or auto-train XGBoost
+        if _model_store["model"] is not None:
+            model       = _model_store["model"]
+            feats       = _model_store["features"]
+            model_label = f"{_model_store['target']} model (already trained)"
+        else:
+            from xgboost import XGBRegressor
+            # encode text columns so there are features to train on
+            num_feats_avail = [c for c in df_c.columns
+                               if pd.api.types.is_numeric_dtype(df_c[c])]
+            target_auto = "matched_score" if "matched_score" in num_feats_avail else (
+                num_feats_avail[-1] if num_feats_avail else df_c.columns[-1])
+            for col in list(df_c.columns):
+                if col != target_auto and not pd.api.types.is_numeric_dtype(df_c[col]):
+                    df_c[col] = pd.Series(
+                        pd.factorize(df_c[col])[0], index=df_c.index, dtype="int64"
+                    )
+            feats = [c for c in df_c.columns
+                     if c != target_auto and pd.api.types.is_numeric_dtype(df_c[c])]
+            if not feats:
+                return dbc.Alert(
+                    "Not enough columns to predict — upload a dataset with more features.",
+                    color="danger"), True
+            model = XGBRegressor(n_estimators=100, max_depth=4, learning_rate=0.05,
+                                 random_state=42, n_jobs=-1, verbosity=0)
+            model.fit(df_c[feats].fillna(0), df_c[target_auto])
+            model_label = f"auto-trained XGBoost  |  target: '{target_auto}'  |  {len(feats)} features"
+            _model_store["model"]    = model
+            _model_store["features"] = feats
+            _model_store["target"]   = target_auto
 
-    # align features — drop any missing from this dataset
-    avail_feats = [f for f in feats if f in df_c.columns]
-    if not avail_feats:
-        return dbc.Alert(
-            "The trained model's features are not present in this dataset.", color="danger"), True
+        # build prediction matrix — encode any text feature columns then zero-pad
+        # so the model always receives exactly the same shape it was trained on
+        X_pred = pd.DataFrame(0.0, index=df_c.index, columns=feats)
+        for f in feats:
+            if f in df_c.columns:
+                col_data = df_c[f]
+                if not pd.api.types.is_numeric_dtype(col_data):
+                    col_data = pd.Series(
+                        pd.factorize(col_data)[0], index=df_c.index, dtype="int64"
+                    )
+                X_pred[f] = pd.to_numeric(col_data, errors="coerce").fillna(0)
 
-    preds = model.predict(df_c[avail_feats].fillna(0))
-    out = df_c.copy()
-    out["predicted_score"] = preds.round(4)
+        preds = model.predict(X_pred.values)
+        out   = df_c.copy()
+        out["predicted_score"] = np.round(preds, 4)
 
-    # save to store for download
-    _model_store["last_predictions"] = out
+        # save to store for download
+        _model_store["last_predictions"] = out
 
-    # build scatter if actual column chosen
-    scatter_card = html.Div()
-    if actual_col and actual_col in out.columns:
-        r2  = float(np.corrcoef(out[actual_col], out["predicted_score"])[0,1]**2)
-        mae = float(np.abs(out[actual_col] - out["predicted_score"]).mean())
-        fig_s = px.scatter(
-            out.sample(min(3000, len(out)), random_state=42),
-            x=actual_col, y="predicted_score",
-            opacity=0.4, color_discrete_sequence=[PRIMARY],
-            labels={actual_col: f"Actual ({actual_col})", "predicted_score": "Predicted"},
+        # build scatter if actual column chosen
+        scatter_card = html.Div()
+        if actual_col and actual_col in out.columns:
+            act    = pd.to_numeric(out[actual_col], errors="coerce")
+            pred_s = out["predicted_score"]
+            valid  = act.notna() & pred_s.notna()
+            corr   = np.corrcoef(act[valid], pred_s[valid])[0, 1] if valid.sum() > 1 else 0.0
+            r2     = float(corr ** 2)
+            mae    = float(np.abs(act[valid] - pred_s[valid]).mean())
+            sample = out.sample(min(3000, len(out)), random_state=42)
+            fig_s  = px.scatter(
+                sample, x=actual_col, y="predicted_score",
+                opacity=0.4, color_discrete_sequence=[PRIMARY],
+                labels={actual_col: f"Actual ({actual_col})", "predicted_score": "Predicted"},
+            )
+            lim = [float(out[actual_col].min()), float(out[actual_col].max())]
+            fig_s.add_trace(go.Scatter(x=lim, y=lim, mode="lines",
+                                        line=dict(color=DANGER, dash="dash", width=1.5),
+                                        name="Perfect"))
+            fig_s.update_layout(plot_bgcolor="white", paper_bgcolor="white",
+                                 margin=dict(l=20, r=20, t=10, b=20), height=300)
+            scatter_card = html.Div([
+                html.H6(f"Predicted vs Actual  ·  R²={r2:.3f}  MAE={mae:.4f}",
+                        style={"fontWeight": "700"}),
+                dcc.Graph(figure=fig_s, style={"height": "300px"}),
+            ], style=CARD)
+
+        # preview table (top 20 rows, show predicted + a few feature cols)
+        preview_cols = (
+            ([actual_col] if actual_col and actual_col in out.columns else []) +
+            ["predicted_score"] +
+            [f for f in feats[:5] if f in out.columns]
         )
-        lim = [float(out[actual_col].min()), float(out[actual_col].max())]
-        fig_s.add_trace(go.Scatter(x=lim, y=lim, mode="lines",
-                                    line=dict(color=DANGER, dash="dash", width=1.5),
-                                    name="Perfect"))
-        fig_s.update_layout(plot_bgcolor="white", paper_bgcolor="white",
-                             margin=dict(l=20,r=20,t=10,b=20), height=300)
-        scatter_card = html.Div([
-            html.H6(f"Predicted vs Actual  ·  R²={r2:.3f}  MAE={mae:.4f}",
-                    style={"fontWeight":"700"}),
-            dcc.Graph(figure=fig_s, style={"height":"300px"}),
-        ], style=CARD)
+        preview = out[preview_cols].head(20).round(4)
 
-    # preview table (top 20)
-    preview_cols = [c for c in ([actual_col] if actual_col else []) +
-                    ["predicted_score"] + avail_feats[:5] if c in out.columns]
-    preview = out[preview_cols].head(20).round(4)
-
-    return html.Div([
-        dbc.Alert(
-            [html.Strong("✅  Predictions ready  ·  "),
-             f"{len(out):,} rows  ·  using {model_label}"],
-            color="success", style={"padding":"10px 16px","marginBottom":"12px"},
-        ),
-        scatter_card,
-        html.Div([
-            html.H6("Preview (top 20 rows)", style={"fontWeight":"700"}),
-            dash_table.DataTable(
-                data=preview.astype(str).to_dict("records"),
-                columns=[{"name":c,"id":c} for c in preview.columns],
-                style_table={"overflowX":"auto"},
-                style_header={"backgroundColor":PRIMARY,"color":"white",
-                              "fontSize":"11px","fontWeight":"700"},
-                style_cell={"fontSize":"11px","padding":"6px 10px",
-                            "maxWidth":"160px","overflow":"hidden","textOverflow":"ellipsis"},
-                style_data_conditional=[
-                    {"if":{"column_id":"predicted_score"},
-                     "backgroundColor":"#e8f4ff","fontWeight":"700"},
-                    {"if":{"row_index":"odd"},"backgroundColor":"#f8f9fa"},
-                ],
+        return html.Div([
+            dbc.Alert(
+                [html.Strong("✅  Predictions ready  ·  "),
+                 f"{len(out):,} rows  ·  using {model_label}"],
+                color="success", style={"padding": "10px 16px", "marginBottom": "12px"},
             ),
-        ], style=CARD),
-        html.P("Click ⬇️ Download CSV above to get the full predictions file.",
-               style={"fontSize":"12px","color":SECONDARY}),
-    ]), False
+            scatter_card,
+            html.Div([
+                html.H6("Preview (top 20 rows)", style={"fontWeight": "700"}),
+                dash_table.DataTable(
+                    data=preview.astype(str).to_dict("records"),
+                    columns=[{"name": c, "id": c} for c in preview.columns],
+                    style_table={"overflowX": "auto"},
+                    style_header={"backgroundColor": PRIMARY, "color": "white",
+                                  "fontSize": "11px", "fontWeight": "700"},
+                    style_cell={"fontSize": "11px", "padding": "6px 10px",
+                                "maxWidth": "160px", "overflow": "hidden",
+                                "textOverflow": "ellipsis"},
+                    style_data_conditional=[
+                        {"if": {"column_id": "predicted_score"},
+                         "backgroundColor": "#e8f4ff", "fontWeight": "700"},
+                        {"if": {"row_index": "odd"}, "backgroundColor": "#f8f9fa"},
+                    ],
+                ),
+            ], style=CARD),
+            html.P("Click ⬇️ Download CSV above to get the full predictions file.",
+                   style={"fontSize": "12px", "color": SECONDARY}),
+        ]), False
+
+    except Exception as e:
+        return dbc.Alert(
+            [html.Strong("Prediction error: "), str(e)],
+            color="danger", style={"whiteSpace": "pre-wrap"},
+        ), True
 
 
 # ── Download predictions CSV ──────────────────────────────────
@@ -1259,6 +1476,159 @@ def download_predictions(n):
     if df_out is None:
         return no_update
     return dcc.send_data_frame(df_out.to_csv, "predictions.csv", index=False)
+
+
+# ── K-Means Clustering ───────────────────────────────────────
+@app.callback(
+    Output("kmeans-results", "children"),
+    Input("btn-run-kmeans", "n_clicks"),
+    State("store-cleaned", "data"),
+    State("kmeans-k", "value"),
+    prevent_initial_call=True,
+)
+def run_kmeans_cb(n, cleaned, k):
+    try:
+        from sklearn.cluster import KMeans
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.decomposition import PCA
+
+        if not cleaned:
+            return dbc.Alert("Run Preprocessing first.", color="warning")
+
+        df_c = store_to_df(cleaned)
+        for col in df_c.columns:
+            pass  # replaced below
+
+        num_cols_k = df_c.select_dtypes(include=np.number).columns.tolist()
+        if not num_cols_k:
+            return dbc.Alert("No numeric columns found for clustering.", color="danger")
+
+        X = df_c[num_cols_k].fillna(0).values
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        # elbow curve (k = 2..10)
+        inertias = []
+        k_range  = list(range(2, 11))
+        for ki in k_range:
+            km_i = KMeans(n_clusters=ki, random_state=42, n_init="auto")
+            km_i.fit(X_scaled)
+            inertias.append(km_i.inertia_)
+
+        fig_elbow = go.Figure(go.Scatter(
+            x=k_range, y=inertias, mode="lines+markers",
+            line=dict(color=PRIMARY, width=2),
+            marker=dict(size=8, color=[DANGER if ki == k else PRIMARY for ki in k_range]),
+        ))
+        fig_elbow.add_vline(x=k, line_dash="dash", line_color=DANGER,
+                            annotation_text=f"K={k}", annotation_position="top right")
+        fig_elbow.update_layout(
+            xaxis_title="K", yaxis_title="Inertia (within-cluster variance)",
+            plot_bgcolor="white", paper_bgcolor="white",
+            margin=dict(l=20,r=20,t=10,b=30), height=260,
+        )
+
+        # final fit at chosen K
+        km  = KMeans(n_clusters=k, random_state=42, n_init="auto")
+        labels = km.fit_predict(X_scaled)
+        df_c["cluster"] = labels.astype(str)
+
+        # cluster sizes
+        sizes = pd.Series(labels).value_counts().sort_index()
+        fig_sizes = px.bar(
+            x=[f"Cluster {i}" for i in sizes.index], y=sizes.values,
+            color=sizes.values, color_continuous_scale=[[0,"#c3d8f7"],[1,PRIMARY]],
+            labels={"x":"Cluster","y":"Count"},
+        )
+        fig_sizes.update_layout(plot_bgcolor="white", paper_bgcolor="white",
+                                 margin=dict(l=20,r=20,t=10,b=20), height=260,
+                                 coloraxis_showscale=False)
+
+        # PCA 2-D scatter (only when we have ≥2 features)
+        n_pca = min(2, X_scaled.shape[1])
+        if n_pca >= 2:
+            pca    = PCA(n_components=2, random_state=42)
+            X_2d   = pca.fit_transform(X_scaled)
+            var    = pca.explained_variance_ratio_
+            pca_df = pd.DataFrame({
+                "PC1": X_2d[:,0], "PC2": X_2d[:,1],
+                "Cluster": [f"Cluster {i}" for i in labels],
+            })
+            sample  = pca_df.sample(min(3000, len(pca_df)), random_state=42)
+            fig_pca = px.scatter(
+                sample, x="PC1", y="PC2", color="Cluster", opacity=0.55,
+                labels={"PC1": f"PC1 ({var[0]*100:.1f}% var)",
+                        "PC2": f"PC2 ({var[1]*100:.1f}% var)"},
+            )
+            fig_pca.update_layout(plot_bgcolor="white", paper_bgcolor="white",
+                                   margin=dict(l=20,r=20,t=10,b=20), height=320)
+            pca_card = html.Div([
+                html.H6("PCA 2D View — Clusters in Feature Space", style={"fontWeight":"700"}),
+                dcc.Graph(figure=fig_pca, style={"height":"320px"}),
+            ], style=CARD)
+        else:
+            # single feature — show distribution per cluster instead
+            fig_pca = px.histogram(
+                df_c, x=num_cols_k[0], color="cluster", barmode="overlay",
+                opacity=0.65, labels={"cluster":"Cluster"},
+            )
+            fig_pca.update_layout(plot_bgcolor="white", paper_bgcolor="white",
+                                   margin=dict(l=20,r=20,t=10,b=20), height=280)
+            pca_card = html.Div([
+                html.H6(f"Feature Distribution by Cluster  ({num_cols_k[0]})",
+                        style={"fontWeight":"700"}),
+                html.P("Only 1 numeric feature — PCA not applicable.",
+                       style={"fontSize":"12px","color":SECONDARY}),
+                dcc.Graph(figure=fig_pca, style={"height":"280px"}),
+            ], style=CARD)
+
+        # cluster profile table (mean per cluster)
+        profile = df_c.groupby("cluster")[num_cols_k].mean().round(3).reset_index()
+        profile.rename(columns={"cluster": "Cluster"}, inplace=True)
+
+        # save for CSV download
+        _model_store["last_predictions"] = df_c
+
+        return html.Div([
+            dbc.Alert(f"✅  Clustering complete!  K={k}  ·  {len(df_c):,} rows",
+                      color="success", style={"padding":"10px 16px","marginBottom":"12px"}),
+            dbc.Row([
+                dbc.Col(html.Div([
+                    html.H6("Elbow Curve", style={"fontWeight":"700"}),
+                    html.P("Look for the 'elbow' — where inertia stops dropping sharply.",
+                           style={"fontSize":"12px","color":SECONDARY}),
+                    dcc.Graph(figure=fig_elbow, style={"height":"260px"}),
+                ], style=CARD), md=6),
+                dbc.Col(html.Div([
+                    html.H6("Cluster Sizes", style={"fontWeight":"700"}),
+                    dcc.Graph(figure=fig_sizes, style={"height":"260px"}),
+                ], style=CARD), md=6),
+            ]),
+            pca_card,
+            html.Div([
+                html.H6("Cluster Profiles (mean feature values per cluster)",
+                        style={"fontWeight":"700"}),
+                dash_table.DataTable(
+                    data=profile.to_dict("records"),
+                    columns=[{"name":c,"id":c} for c in profile.columns],
+                    style_table={"overflowX":"auto"},
+                    style_header={"backgroundColor":"#0dcaf0","color":"white",
+                                  "fontWeight":"700","fontSize":"11px"},
+                    style_cell={"fontSize":"11px","padding":"6px 10px","textAlign":"center"},
+                    style_data_conditional=[
+                        {"if":{"column_id":"Cluster"},
+                         "fontWeight":"700","backgroundColor":"#f0fbff"},
+                        {"if":{"row_index":"odd"},"backgroundColor":"#f8f9fa"},
+                    ],
+                ),
+            ], style=CARD),
+            html.P("Use ⬇️ Download CSV (Predict tab) to export the dataset with cluster labels.",
+                   style={"fontSize":"12px","color":SECONDARY}),
+        ])
+
+    except Exception as e:
+        return dbc.Alert([html.Strong("Clustering error: "), str(e)],
+                         color="danger", style={"whiteSpace":"pre-wrap"})
 
 
 # ═══════════════════════════════════════════════════════════
